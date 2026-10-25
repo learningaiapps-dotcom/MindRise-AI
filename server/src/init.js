@@ -1,0 +1,1 @@
+import 'dotenv/config';import pg from 'pg';import {readFileSync} from 'node:fs';if(!process.env.DATABASE_URL)throw Error('DATABASE_URL missing');const db=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:true}});await db.query(readFileSync(new URL('../../db/schema.sql',import.meta.url),'utf8'));console.log('Database initialized');await db.end();
