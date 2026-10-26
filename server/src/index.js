@@ -1,16 +1,29 @@
 import 'dotenv/config';
-import express from 'express';import cookieParser from 'cookie-parser';import helmet from 'helmet';import cors from 'cors';import rateLimit from 'express-rate-limit';import jwt from 'jsonwebtoken';import pg from 'pg';import OpenAI from 'openai';import {sampleForDay} from './content.js';import path from 'node:path';import fs from 'node:fs';import crypto from 'node:crypto';import {fileURLToPath} from 'node:url';
+import express from 'express';import cookieParser from 'cookie-parser';import helmet from 'helmet';import cors from 'cors';import rateLimit from 'express-rate-limit';import jwt from 'jsonwebtoken';import pg from 'pg';import OpenAI from 'openai';import {sampleForDay} from './content.js';import path from 'node:path';import fs from 'node:fs';import {OAuth2Client} from 'google-auth-library';import {fileURLToPath} from 'node:url';
 const app=express(),prod=process.env.NODE_ENV==='production',port=Number(process.env.PORT||10000);
-for(const k of ['APP_PASSWORD','JWT_SECRET','DATABASE_URL'])if(!process.env[k])throw Error('Missing '+k);
+for(const k of ['GOOGLE_CLIENT_ID','GOOGLE_ALLOWED_EMAIL','JWT_SECRET','DATABASE_URL'])if(!process.env[k])throw Error('Missing '+k);
 const db=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:true}});
+const googleClient=new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const ai=process.env.OPENAI_API_KEY?new OpenAI({apiKey:process.env.OPENAI_API_KEY}):null;
 app.use(helmet({contentSecurityPolicy:false}));app.use(cors({origin:process.env.FRONTEND_ORIGIN||'http://localhost:5173',credentials:true}));app.use(express.json({limit:'100kb'}));app.use(cookieParser());app.use('/api',rateLimit({windowMs:60000,limit:90,standardHeaders:'draft-7',legacyHeaders:false}));
 const route=f=>(req,res,next)=>Promise.resolve(f(req,res,next)).catch(next);
-const auth=(req,res,next)=>{try{jwt.verify(req.cookies.mindrise,process.env.JWT_SECRET);next()}catch{res.status(401).json({error:'Sign in required'})}};
+const auth=(req,res,next)=>{try{const session=jwt.verify(req.cookies.mindrise,process.env.JWT_SECRET);if(session.sub!==process.env.GOOGLE_ALLOWED_EMAIL.trim().toLowerCase())throw Error('Account not authorized');req.user=session;next()}catch{res.status(401).json({error:'Sign in required'})}};
 const today=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Kolkata'});
 app.get('/api/health',(_,res)=>res.json({ok:true}));
-app.post('/api/login',rateLimit({windowMs:900000,limit:12}),route(async(req,res)=>{const a=crypto.createHash('sha256').update(String(req.body.password||'')).digest(),b=crypto.createHash('sha256').update(process.env.APP_PASSWORD).digest();if(!crypto.timingSafeEqual(a,b))return res.status(401).json({error:'Incorrect password'});res.cookie('mindrise',jwt.sign({sub:'owner'},process.env.JWT_SECRET,{expiresIn:'7d'}),{httpOnly:true,secure:prod,sameSite:'lax',maxAge:604800000});res.json({ok:true})}));
-app.post('/api/logout',(_,res)=>{res.clearCookie('mindrise');res.json({ok:true})});app.get('/api/me',auth,(_,res)=>res.json({ok:true}));
+app.get('/api/auth/config',(_,res)=>res.json({clientId:process.env.GOOGLE_CLIENT_ID}));
+app.post('/api/auth/google',rateLimit({windowMs:900000,limit:20}),route(async(req,res)=>{
+ const credential=req.body?.credential;
+ if(typeof credential!=='string'||credential.length>10000||credential.length<100)return res.status(400).json({error:'Invalid Google credential'});
+ let payload;
+ try{const ticket=await googleClient.verifyIdToken({idToken:credential,audience:process.env.GOOGLE_CLIENT_ID});payload=ticket.getPayload()}catch{return res.status(401).json({error:'Google sign-in could not be verified'})}
+ const allowed=process.env.GOOGLE_ALLOWED_EMAIL.trim().toLowerCase();
+ if(!payload?.email_verified||payload.email?.toLowerCase()!==allowed||!payload.sub)return res.status(403).json({error:'This Google account is not authorized'});
+ const token=jwt.sign({sub:allowed,googleSub:payload.sub},process.env.JWT_SECRET,{expiresIn:'7d'});
+ res.cookie('mindrise',token,{httpOnly:true,secure:prod,sameSite:'lax',path:'/',maxAge:604800000});
+ res.json({ok:true,name:payload.name||'',email:allowed});
+}));
+app.post('/api/logout',(_,res)=>{res.clearCookie('mindrise',{httpOnly:true,secure:prod,sameSite:'lax',path:'/'});res.json({ok:true})});
+app.get('/api/me',auth,(req,res)=>res.json({ok:true,email:req.user.sub}));
 const publicLesson=c=>({...c,questions:c.questions.map(x=>({q:x.q})),puzzles:c.puzzles.map(x=>({q:x.q,options:x.options}))});
 async function lesson(lang,day){const base=sampleForDay(day,lang);if(!ai)return base;try{const r=await ai.chat.completions.create({model:process.env.OPENAI_MODEL||'gpt-4.1-mini',response_format:{type:'json_object'},messages:[{role:'system',content:'Create a safe daily personal-development lesson in language '+lang+'. Output JSON keys topic,article (350-450 words),questions (5 objects each q and answer),words (6 strings),puzzles (5 objects each q, options array of four strings, answer integer 0-3),speech (topic string). No unsupported factual claims.'},{role:'user',content:'Generate lesson for '+day}]});const c=JSON.parse(r.choices[0].message.content);if(c.questions?.length!==5||c.puzzles?.length!==5||c.words?.length!==6||typeof c.article!=='string')throw Error('Invalid AI content');return {...c,source:'ai'}}catch(e){console.error('AI lesson fallback',e.message);return base}}
 app.post('/api/session',auth,route(async(req,res)=>{const lang=['en','hi','gu'].includes(req.body.language)?req.body.language:'en',day=today();let r=await db.query('SELECT * FROM sessions WHERE day=$1',[day]);if(!r.rowCount){const c=await lesson(lang,day);r=await db.query('INSERT INTO sessions(day,topic,language,content) VALUES($1,$2,$3,$4) ON CONFLICT(day) DO UPDATE SET day=EXCLUDED.day RETURNING *',[day,c.topic,lang,c])}const s=r.rows[0];res.json({id:s.id,day:s.day,topic:s.topic,language:s.language,content:publicLesson(s.content)})}));
